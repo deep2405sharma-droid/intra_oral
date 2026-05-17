@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Data files (too large for GitHub)
+data/
+SMART-OM/
+*.csv
+*.json
+*.jpg
+*.jpeg
+*.png
+*.JPG
+*.pth
+*.pkl
+
+# Logs
+logs/
+
+# Outputs
+outputs/
+reports/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
