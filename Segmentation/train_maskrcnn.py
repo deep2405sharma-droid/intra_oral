@@ -74,7 +74,7 @@ def build_data_loaders(
     batch_size: int,
     num_workers: int,
     seed: int,
-    debug_n_images: int = 20,
+    debug_n_images: int = None,
 ) -> tuple:
     """
     Read the dataset CSV and return (train_loader, val_loader, num_classes).
