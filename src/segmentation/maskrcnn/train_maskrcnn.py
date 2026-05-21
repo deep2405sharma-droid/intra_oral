@@ -760,7 +760,7 @@ def get_configpath():
 if __name__ == "__main__":
     config_path = get_configpath()
     config = load_config(config_path)
-    logger = getLogger(config=config)
+    logger = getLogger(config.get("PATHS", "log_file"))
     maskrcnn_cfg = load_config(config.get("SEGMENT-MASKRCNN", "maskrcnn.config"))
     cfg = MaskRCNNConfig(maskrcnn_cfg)
     csv_path = get_dataset_path(logger, config, cfg)
