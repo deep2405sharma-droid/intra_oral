@@ -46,7 +46,7 @@ import pandas as pd
 
 from pathlib import Path
 
-from src.common.intraoral_logger import initialize_logger
+from src.common.intraoral_logger import getLogger
 from utils.load_configuration import load_config
 from src.segmentation.maskrcnn.config.maskrcnnconfig import MaskRCNNConfig
 from src.segmentation.maskrcnn.mask_rcnn_builder import (
@@ -760,7 +760,7 @@ def get_configpath():
 if __name__ == "__main__":
     config_path = get_configpath()
     config = load_config(config_path)
-    logger = initialize_logger(config=config)
+    logger = getLogger(config=config)
     maskrcnn_cfg = load_config(config.get("SEGMENT-MASKRCNN", "maskrcnn.config"))
     cfg = MaskRCNNConfig(maskrcnn_cfg)
     csv_path = get_dataset_path(logger, config, cfg)
