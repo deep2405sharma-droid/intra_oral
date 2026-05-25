@@ -1,6 +1,7 @@
 import logging
 import os 
 from pathlib import Path
+import logging.config
 
 def _getLogger(log_fileName: str):
     # Load logging configuration from lo_config.ini
