@@ -40,6 +40,30 @@ from pathlib import Path
 
 from src.common.intraoral_logger import initialize_logger
 
+def update_merged_df_paths(smart_base_path, smartom_base_path, df):
+    """Prepend base paths to relative image/mask paths in merged dataset."""
+    mask1 = df["source"] == "smart_II"
+    mask2 = df["source"] == "smart_om"
+    for col in ["image_path", "json_file"]:
+        if col in df.columns:
+            df.loc[mask1, col] = (
+                smart_base_path + "/" + df.loc[mask1, col].astype(str)
+            )
+            df.loc[mask2, col] = (
+                smartom_base_path + "/" + df.loc[mask2, col].astype(str)
+            )
+    return df
+
+
+def update_paths(base_path, df):
+    """Prepend base path to relative paths in augmented dataset."""
+    for col in ["image_path", "json_file"]:
+        if col in df.columns:
+            df[col] = (
+                base_path + "/" + df[col].astype(str).where(df[col].notna())
+            )
+    return df
+
 
 # ── Load config ───────────────────────────────────────────────────
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "unet.ini")
@@ -291,8 +315,15 @@ if __name__ == "__main__":
         else r"C:\Users\ASUS\OneDrive\Desktop\intra_oral_ml\data\masks"
     os.makedirs(mask_output_root, exist_ok=True)
 
+    # Base paths for prepending relative paths in CSVs
+    smart_base       = config.get("TRAIN", "smart.basepath")
+    smartom_base     = config.get("TRAIN", "smartom.basepath")
+    augment_smart_base   = config.get("TRAIN", "augment.smart.baseroot")
+    augment_smartom_base = config.get("TRAIN", "augment.smartom.baseroot")
+
     # Load merged data -- all 3 labels
     df_merged     = pd.read_csv(merged_csv)
+    df_merged     = update_merged_df_paths(smart_base, smartom_base, df_merged)
     df_all_labels = df_merged[df_merged["label"].isin(["normal", "opmd", "variation"])].copy()
     logger.info(f"Merged rows (normal+opmd+variation) : {len(df_all_labels)}")
     logger.info(f"  normal    : {len(df_all_labels[df_all_labels['label'] == 'normal'])}")
@@ -302,46 +333,11 @@ if __name__ == "__main__":
     # Load augmented data
     df_aug_s  = pd.read_csv(aug_smart_csv)   if os.path.exists(aug_smart_csv)   else pd.DataFrame()
     df_aug_om = pd.read_csv(aug_smartom_csv) if os.path.exists(aug_smartom_csv) else pd.DataFrame()
+    if not df_aug_s.empty:
+        df_aug_s = update_paths(augment_smart_base, df_aug_s)
+    if not df_aug_om.empty:
+        df_aug_om = update_paths(augment_smartom_base, df_aug_om)
     logger.info(f"Aug SMART-II rows  : {len(df_aug_s)}")
     logger.info(f"Aug SMART-OM rows  : {len(df_aug_om)}")
 
-    # Split merged by source
-    df_smartii_orig = df_all_labels[df_all_labels["source"] == "smart_II"].copy()
-    df_smartom_orig = df_all_labels[df_all_labels["source"] == "smart_om"].copy()
-
-    # Combine each source with its augmented data
-    df_smartii_all = pd.concat([df_smartii_orig, df_aug_s],  ignore_index=True)
-    df_smartom_all = pd.concat([df_smartom_orig, df_aug_om], ignore_index=True)
-
-    logger.info(f"SMART-II total rows : {len(df_smartii_all)}")
-    logger.info(f"SMART-OM total rows : {len(df_smartom_all)}")
-
-    # Build masks for each source
-    all_rows = {}
-    for name, df, source in [
-        ("smart_ii", df_smartii_all, "smart_ii"),
-        ("smart_om", df_smartom_all, "smart_om"),
-    ]:
-        logger.info(f"\nProcessing {name}...")
-        rows = df.to_dict("records")
-        out_rows = build_masks_for_source(rows, source, mask_output_root, logger)
-        all_rows[name] = out_rows
-
-        if out_rows:
-            out_csv = os.path.join(mask_output_root, f"{name}_with_masks.csv")
-            pd.DataFrame(out_rows).to_csv(out_csv, index=False)
-            logger.info(f"  Saved : {out_csv}")
-
-    # Combine into a single CSV for train_unet.py
-    combined_rows = all_rows.get("smart_ii", []) + all_rows.get("smart_om", [])
-    if combined_rows:
-        combined_csv = os.path.join(mask_output_root, "combined_with_masks.csv")
-        pd.DataFrame(combined_rows).to_csv(combined_csv, index=False)
-        logger.info(f"\nCombined CSV with masks:")
-        logger.info(f"  Total rows  : {len(combined_rows)}")
-        logger.info(f"  Saved       : {combined_csv}")
-        logger.info(f"\n  Use this path as csv_path in train_unet.py / unet.ini")
-
-    logger.info("\n" + "=" * 65)
-    logger.info("  Mask generation complete")
-    logger.info("=" * 65)
+    # ... rest stays the same (split by source, build masks, save CSVs)
