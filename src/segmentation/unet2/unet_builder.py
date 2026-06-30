@@ -351,14 +351,24 @@ def build_lesion_model(
         decoder_use_batchnorm=True,
         activation=None,
     )
-    logger.info(
-        "Model Summary:\n%s",
-        summary(model, input_size=(1, 3, 512, 512), verbose=0) if _HAS_TORCHINFO
-        else "(torchinfo not installed -- skipping summary; "
-             "run `pip install torchinfo` to enable)",
-    )
     dev = _resolve_device(logger, device)
     model.to(dev)
+
+    # Model summary is purely informational -- never let a forward-pass
+    # failure here (e.g. incompatible GPU kernel) block training itself.
+    if _HAS_TORCHINFO:
+        try:
+            logger.info(
+                "Model Summary:\n%s",
+                summary(model, input_size=(1, 3, 512, 512), device=dev, verbose=0),
+            )
+        except Exception as e:
+            logger.warning("Skipping model summary (forward pass failed): %s", e)
+    else:
+        logger.info(
+            "Model Summary: (torchinfo not installed -- skipping summary; "
+            "run `pip install torchinfo` to enable)"
+        )
     logger.info("Lesion SMP UNet built on %s", dev)
     return model
 
