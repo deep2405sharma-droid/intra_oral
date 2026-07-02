@@ -11,7 +11,10 @@ def _getLogger(log_fileName: str):
     logging.config.fileConfig(log_fileName, disable_existing_loggers=False)
     # Use logging as usual
     logger = logging.getLogger(__name__)
+    for name in ["PIL", "PIL.TiffImagePlugin", "PIL.Image", "PIL.PngImagePlugin"]:
+        logging.getLogger(name).setLevel(logging.WARNING)
     return logger
+
 
 
 def initialize_logger(config):
