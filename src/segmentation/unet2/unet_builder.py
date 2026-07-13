@@ -439,7 +439,14 @@ def build_data_loaders(
             "No annotated images found on disk. Check csv_path and path_rewrite."
         )
 
-    # ── Patient-wise split (identical to mask_rcnn_builder) ───────────
+    # ── Patient-wise split ────────────────────────────────────────────
+    # Each patient_id goes ENTIRELY into train or val — never split
+    # across sets.  This prevents data leakage where the model could
+    # memorise patient-specific tissue appearance.
+    #
+    # Uses sklearn GroupShuffleSplit instead of a simple torch.randperm
+    # shuffler so the split is guaranteed non-overlapping at the patient
+    # level, not just at the row level.
     if "patient_id" not in df.columns:
         raise RuntimeError("Column 'patient_id' is required for patient-wise split.")
 
@@ -449,22 +456,52 @@ def build_data_loaders(
             f"Need ≥2 unique patient_ids for split, got {len(patient_ids)}."
         )
 
-    g = torch.Generator().manual_seed(seed)
-    shuffled = [
-        patient_ids[i] for i in torch.randperm(len(patient_ids), generator=g).tolist()
-    ]
-    n_val = max(1, min(int(len(shuffled) * val_split), len(shuffled) - 1))
-    val_pids = set(shuffled[:n_val])
-    train_pids = set(shuffled[n_val:])
+    try:
+        from sklearn.model_selection import GroupShuffleSplit
+        _HAS_SKLEARN = True
+    except ImportError:
+        _HAS_SKLEARN = False
+        logger.warning(
+            "sklearn not installed — falling back to random.shuffle. "
+            "Install with: pip install scikit-learn"
+        )
 
-    train_df = df[df["patient_id"].isin(train_pids)].reset_index(drop=True)
-    val_df = df[df["patient_id"].isin(val_pids)].reset_index(drop=True)
+    if _HAS_SKLEARN:
+        # groups= maps every row to its patient_id so GroupShuffleSplit
+        # knows which rows belong to the same patient and keeps them together.
+        gss = GroupShuffleSplit(n_splits=1, test_size=val_split, random_state=seed)
+        groups = df["patient_id"].values
+        train_idx, val_idx = next(gss.split(df, groups=groups))
+        train_df = df.iloc[train_idx].reset_index(drop=True)
+        val_df   = df.iloc[val_idx].reset_index(drop=True)
+    else:
+        # Fallback: manual patient-wise shuffle with fixed seed
+        import random
+        rng = random.Random(seed)
+        shuffled = patient_ids.copy()
+        rng.shuffle(shuffled)
+        n_val      = max(1, min(int(len(shuffled) * val_split), len(shuffled) - 1))
+        val_pids   = set(shuffled[:n_val])
+        train_pids = set(shuffled[n_val:])
+        train_df   = df[df["patient_id"].isin(train_pids)].reset_index(drop=True)
+        val_df     = df[df["patient_id"].isin(val_pids)].reset_index(drop=True)
+
+    # Sanity check — confirm zero patient overlap between train and val
+    train_pids_final = set(train_df["patient_id"].unique())
+    val_pids_final   = set(val_df["patient_id"].unique())
+    overlap = train_pids_final & val_pids_final
+    if overlap:
+        raise RuntimeError(
+            f"Patient ID overlap detected between train and val: {overlap}"
+        )
+    else:
+        logger.info("No overlap of patient IDs in train and val datasets.")
 
     logger.info(
         "  Patient split → train_patients=%d (%d rows)  val_patients=%d (%d rows)",
-        len(train_pids),
+        len(train_pids_final),
         len(train_df),
-        len(val_pids),
+        len(val_pids_final),
         len(val_df),
     )
 
