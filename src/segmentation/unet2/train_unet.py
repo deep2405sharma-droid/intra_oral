@@ -709,7 +709,7 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
                 logger, model, optimizer, epoch, all_metrics, best_ckpt_path
             )
             logger.info(
-                "  ★ New best val_dice=%.4f — saved to %s",
+                "   New best val_dice=%.4f — saved to %s",
                 best_dice,
                 best_ckpt_path,
             )
@@ -730,7 +730,7 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         },
         final_model_path,
     )
-    logger.info(f"✅ Best model saved to: {final_model_path}")
+    logger.info(f" Best model saved to: {final_model_path}")
 
     # ── Save test/visualization results ───────────────────────────────
     if val_loader is not None and len(val_loader) > 0:
@@ -742,6 +742,21 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         logger.info("Generating validation visualizations...")
         model.eval()
         results = []
+
+        # Load val CSV to look up patient_id and image_path per sample index.
+        # val_loader iterates in the same order as the underlying val dataset
+        # rows, so index i in the loop matches row i in the val subset of the CSV.
+        import pandas as _pd
+        _full_df   = _pd.read_csv(csv_path, dtype=str)
+        _full_df   = _full_df[_full_df["coco_file"].notna()].reset_index(drop=True)
+        # Reconstruct the same val split using the same seed so indices align
+        try:
+            from sklearn.model_selection import GroupShuffleSplit as _GSS
+            _gss = _GSS(n_splits=1, test_size=cfg.val_split, random_state=cfg.seed)
+            _, _val_idx = next(_gss.split(_full_df, groups=_full_df["patient_id"].values))
+            _val_df = _full_df.iloc[_val_idx].reset_index(drop=True)
+        except Exception:
+            _val_df = None
 
         with torch.no_grad():
             for i, (images, masks) in enumerate(val_loader):
@@ -763,7 +778,17 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
                 overlay[pred_np == 1] = [0, 255, 0]  # Green prediction
                 overlay[gt_np == 1] = [0, 0, 255]  # Blue ground truth (overwrites)
 
-                plt.figure(figsize=(15, 5))
+                # Build patient ID + image stem for the title
+                if _val_df is not None and i < len(_val_df):
+                    _row       = _val_df.iloc[i]
+                    _patient   = _row.get("patient_id", "unknown")
+                    _img_stem  = Path(str(_row.get("image_path", ""))).stem
+                    _sup_title = f"Patient: {_patient}  |  Image: {_img_stem}"
+                else:
+                    _sup_title = f"Sample {i:04d}"
+
+                fig = plt.figure(figsize=(15, 5))
+                fig.suptitle(_sup_title, fontsize=11, fontweight="bold")
                 plt.subplot(1, 3, 1)
                 plt.imshow(img_np)
                 plt.title("Original")
@@ -788,7 +813,7 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
 
         # Save summary
         pd.DataFrame(results).to_csv(output_dir / "val_results.csv", index=False)
-        logger.info(f"✅ Validation results and visualizations saved to: {output_dir}")
+        logger.info(f" Validation results and visualizations saved to: {output_dir}")
 
     # ── Save training history ─────────────────────────────────────────
     history_path = checkpoint_dir / "training_history.json"
