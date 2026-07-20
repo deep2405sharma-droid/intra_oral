@@ -163,7 +163,7 @@ def build_data_loaders(
     num_workers: int = 2,
     seed: int = 42,
     input_size: Tuple[int, int] = (224, 224),
-    weighted_sampler: bool = True,
+    weighted_sampler: bool = False,
 ) -> Tuple[DataLoader, DataLoader, int]:
     """
     Read the dataset CSV and return (train_loader, val_loader, num_classes).
