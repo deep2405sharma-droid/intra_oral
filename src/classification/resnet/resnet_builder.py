@@ -41,7 +41,7 @@ LABEL_CLASS_MAP = {
 NUM_CLASSES = len(LABEL_CLASS_MAP)  # 3
 
 # Class weights for CrossEntropyLoss — OPMD highest (rarest, most critical)
-CLASS_WEIGHTS = [1.0, 8.0, 6.0]   # normal, opmd, variation
+CLASS_WEIGHTS = [1.0, 8.0, 3.0]   # normal, opmd, variation
 
 
 # ══════════════════════════════════════════════════════════════════════════════
