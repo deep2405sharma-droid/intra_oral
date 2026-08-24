@@ -629,11 +629,11 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         # over cfg.epochs steps.  This prevents aggressive drops that can
         # destabilise the pretrained encoder weights.
         # Formula: η_t = η_min + ½(η_max − η_min)(1 + cos(π · t / T_max))
-        scheduler = optim.lr_scheduler.AnnealingCosineLR(
-            optimizer,
-            T_max=cfg.epochs,
-            eta_min=cfg.min_lr,
-        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=cfg.epochs,
+                eta_min=cfg.min_lr,
+            )
     elif cfg.lr_scheduler == "step":
         scheduler = optim.lr_scheduler.StepLR(
             optimizer, step_size=cfg.lr_patience, gamma=cfg.lr_factor
