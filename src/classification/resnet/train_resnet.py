@@ -18,8 +18,8 @@ Pipeline
 2. build_data_loaders()  ->  patient-wise train / val split
 3. build_lesion_model()  ->  ResNet50 + custom FC head
 4. Training loop         ->  weighted CE loss + cosine LR decay
-5. Validation loop       ->  accuracy, F1, per-class metrics
-6. Checkpointing         ->  best val_f1_macro model saved
+5. Validation loop       ->  accuracy, F1 (via sklearn classification_report)
+6. Checkpointing         ->  best val_macro_f1 model saved
 
 Dataset contract
 ----------------
@@ -46,6 +46,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.metrics import classification_report
 
 from src.common.intraoral_logger import initialize_logger
 from utils.load_configuration import load_config
@@ -68,10 +69,26 @@ sys.path.insert(0, str(_ROOT))
 logging.getLogger("PIL").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+# Class names in index order (0=normal, 1=opmd, 2=variation), derived from
+# LABEL_CLASS_MAP so it can never drift out of sync with the model's output
+# indices.
+CLASS_NAMES = [k for k, v in sorted(LABEL_CLASS_MAP.items(), key=lambda x: x[1])]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Metrics
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    """
+    Batch accuracy from raw logits.
+
+    logits  : [B, num_classes] — raw model output (pre-softmax)
+    targets : [B]              — ground truth class index per image
+    """
+    preds = logits.argmax(dim=1)
+    return (preds == targets).float().mean().item()
 
 
 def compute_metrics(
@@ -80,17 +97,13 @@ def compute_metrics(
     num_classes: int = NUM_CLASSES,
 ) -> dict:
     """
-    Compute classification metrics from batched predictions and targets.
+    Hand-rolled classification metrics from batched predictions/targets.
+    Still used for train_one_epoch(); validate_one_epoch() now uses
+    sklearn.metrics.classification_report instead (see below) since it
+    gives macro/weighted averages for free and is less error-prone.
 
     preds   : [N] — predicted class index per image (argmax of logits)
     targets : [N] — ground truth class index per image
-
-    Returns:
-        accuracy       : overall % correct
-        f1_macro       : macro-averaged F1 across all classes
-        precision_{c}  : per-class precision
-        recall_{c}     : per-class recall
-        f1_{c}         : per-class F1
     """
     results = {}
     smooth  = 1e-6
@@ -200,15 +213,30 @@ def validate_one_epoch(
     output_dir: Path = None, val_df: pd.DataFrame = None,
 ) -> dict:
     """
-    Run inference on the val set and compute classification metrics.
+    Run inference on the val set and compute classification metrics via
+    sklearn.metrics.classification_report (macro/weighted precision,
+    recall, F1 — plus per-class breakdown).
+
+    Also rebuilds val_results.csv: one row per validation sample with
+    patient_id/image_path/true_label/pred_label/correct, so predictions
+    can be traced back to specific patients — same pattern as U-Net's
+    val_results.csv.
+
+    NOTE: the row-alignment against val_df assumes `loader` (the val
+    DataLoader) does NOT shuffle and does NOT drop the last batch — i.e.
+    sample order out of the loader matches val_df's row order exactly.
+    If build_data_loaders() ever turns on shuffling for the val split,
+    this alignment will silently break — double check that before relying
+    on val_results.csv.
 
     @torch.no_grad() disables gradient computation — saves memory and
     speeds up inference since we're not calling .backward() here.
     """
     model.eval()
     total_loss = 0.0
+    total_acc  = 0.0
     all_preds  = []
-    all_labels = []
+    all_targets = []
     results    = []
     n_batches  = 0
 
@@ -219,59 +247,77 @@ def validate_one_epoch(
         logits = model(images)
         loss   = criterion(logits, labels)
         total_loss += loss.item()
+        total_acc  += compute_accuracy(logits, labels)
         n_batches  += 1
 
-        preds = logits.argmax(dim=1)
-        all_preds.append(preds.cpu())
-        all_labels.append(labels.cpu())
+        batch_preds = logits.argmax(dim=1)
+        all_preds.append(batch_preds.cpu().numpy())
+        all_targets.append(labels.cpu().numpy())
 
-        # Per-sample result row — same pattern as unet's val_results.csv,
-        # so results can be traced back to patient_id and image_path.
-        class_names_inv = {v: k for k, v in LABEL_CLASS_MAP.items()}
-        patient_id = ""
-        image_path = ""
-        true_label = ""
-        if val_df is not None and i < len(val_df):
-            row        = val_df.iloc[i]
-            patient_id = row.get("patient_id", "")
-            image_path = str(row.get("image_path", ""))
-            true_label = str(row.get("label", ""))
+        # Per-sample result rows — iterate every sample in the batch
+        # (previous version only ever recorded sample 0 per batch, which
+        # produced a val_results.csv that was both wrong-sized and
+        # misaligned with val_df for batch_size > 1).
+        batch_size = labels.size(0)
+        for j in range(batch_size):
+            global_idx = i * loader.batch_size + j
+            patient_id = ""
+            image_path = ""
+            true_label = ""
+            if val_df is not None and global_idx < len(val_df):
+                row        = val_df.iloc[global_idx]
+                patient_id = row.get("patient_id", "")
+                image_path = str(row.get("image_path", ""))
+                true_label = str(row.get("label", ""))
 
-        results.append({
-            "image_id":   i,
-            "patient_id": patient_id,
-            "image_path": image_path,
-            "true_label": true_label,
-            "pred_label": class_names_inv.get(preds[0].item(), ""),
-            "correct":    int(preds[0].item() == labels[0].item()),
-        })
+            results.append({
+                "image_id":   global_idx,
+                "patient_id": patient_id,
+                "image_path": image_path,
+                "true_label": true_label,
+                "pred_label": CLASS_NAMES[batch_preds[j].item()],
+                "correct":    int(batch_preds[j].item() == labels[j].item()),
+            })
 
     if n_batches == 0:
         logger.warning("Validation loader was empty — no metrics computed.")
         return {}
 
     avg_loss = total_loss / n_batches
+    avg_acc  = total_acc / n_batches
 
-    all_preds  = torch.cat(all_preds)
-    all_labels = torch.cat(all_labels)
-    metrics    = compute_metrics(all_preds, all_labels, num_classes)
-    metrics["val_loss"] = round(avg_loss, 4)
+    y_pred = np.concatenate(all_preds)
+    y_true = np.concatenate(all_targets)
+
+    report = classification_report(
+        y_true,
+        y_pred,
+        labels=list(range(num_classes)),
+        target_names=CLASS_NAMES,
+        output_dict=True,
+        zero_division=0,
+    )
+    macro_f1          = report["macro avg"]["f1-score"]
+    weighted_precision = report["weighted avg"]["precision"]
+    weighted_recall    = report["weighted avg"]["recall"]
+    weighted_f1        = report["weighted avg"]["f1-score"]
 
     logger.info(
-        "Epoch %d  val  loss=%.4f  accuracy=%.4f  f1_macro=%.4f",
-        epoch, avg_loss, metrics["accuracy"], metrics["f1_macro"],
+        "Epoch %d  val  loss=%.4f  acc=%.4f  macro_f1=%.4f weighted_f1=%.4f "
+        "weighted_precision=%.4f weighted_recall=%.4f",
+        epoch, avg_loss, avg_acc, macro_f1, weighted_f1,
+        weighted_precision, weighted_recall,
     )
     logger.info(
-        "  Per-class F1 — normal=%.4f  opmd=%.4f  variation=%.4f",
-        metrics.get("f1_normal",    0.0),
-        metrics.get("f1_opmd",      0.0),
-        metrics.get("f1_variation", 0.0),
+        "  Per-class F1: %s",
+        {name: round(report[name]["f1-score"], 4) for name in CLASS_NAMES},
     )
+    # Recall specifically called out — this is the metric that has been
+    # driving the class-weight tuning (OPMD getting misclassified as
+    # Variation shows up here first).
     logger.info(
-        "  Per-class Recall — normal=%.4f  opmd=%.4f  variation=%.4f",
-        metrics.get("recall_normal",    0.0),
-        metrics.get("recall_opmd",      0.0),
-        metrics.get("recall_variation", 0.0),
+        "  Per-class Recall: %s",
+        {name: round(report[name]["recall"], 4) for name in CLASS_NAMES},
     )
 
     # Save per-sample results CSV
@@ -279,7 +325,16 @@ def validate_one_epoch(
         results_df = pd.DataFrame(results)
         results_df.to_csv(output_dir / "val_results.csv", index=False)
 
-    return metrics
+    return {
+        "val_loss":      round(avg_loss, 4),
+        "val_acc":       round(avg_acc, 4),
+        "val_macro_f1":  round(macro_f1, 4),
+        "val_weighted_f1": round(weighted_f1, 4),
+        # Kept for training_history.json / potential downstream use, but
+        # stripped out before json.dump() — see history_entry below.
+        "_y_true": y_true,
+        "_y_pred": y_pred,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -396,9 +451,9 @@ def train(logger, cfg: ResNetConfig, csv_path: str) -> None:
             logger=logger, model=model, optimizer=optimizer,
             path=resume_path, device=str(device),
         )
-        best_f1      = prev_metrics.get("f1_macro", 0.0)
+        best_f1      = prev_metrics.get("val_macro_f1", 0.0)
         start_epoch += 1
-        logger.info("Resuming from epoch %d  (best f1_macro=%.4f)", start_epoch, best_f1)
+        logger.info("Resuming from epoch %d  (best val_macro_f1=%.4f)", start_epoch, best_f1)
     else:
         logger.info("No checkpoint found — starting fresh training.")
 
@@ -429,34 +484,51 @@ def train(logger, cfg: ResNetConfig, csv_path: str) -> None:
                 output_dir=output_dir, val_df=val_df,
             )
             if cfg.lr_scheduler == "plateau":
-                scheduler.step(val_metrics.get("f1_macro", 0.0))
+                scheduler.step(val_metrics.get("val_macro_f1", 0.0))
 
         # Save last checkpoint (enables resume)
         all_metrics = {**train_metrics, **val_metrics}
         save_checkpoint(logger, model, optimizer, epoch, all_metrics, last_ckpt_path)
 
-        # Save best checkpoint based on val f1_macro
-        # F1 macro is preferred over accuracy due to class imbalance —
+        # Save best checkpoint based on val_macro_f1
+        # Macro F1 is preferred over accuracy due to class imbalance —
         # accuracy is inflated by the dominant normal class
-        current_f1 = val_metrics.get("f1_macro", 0.0)
+        current_f1 = val_metrics.get("val_macro_f1", 0.0)
         if val_metrics and current_f1 > best_f1:
             best_f1 = current_f1
             save_checkpoint(logger, model, optimizer, epoch, all_metrics, best_ckpt_path)
-            logger.info("  New best f1_macro=%.4f — saved to %s", best_f1, best_ckpt_path)
+            logger.info("  New best val_macro_f1=%.4f — saved to %s", best_f1, best_ckpt_path)
 
-        history.append({"epoch": epoch, **all_metrics})
+        # _y_true/_y_pred are numpy arrays — not JSON-serializable, so strip
+        # any underscore-prefixed keys before they hit training_history.json.
+        history_entry = {
+            "epoch": epoch,
+            **{k: v for k, v in all_metrics.items() if not k.startswith("_")},
+        }
+        history.append(history_entry)
 
     # Save training history
     history_path = checkpoint_dir / "training_history.json"
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     logger.info("Training history saved: %s", history_path)
-    logger.info("Training complete. Best f1_macro=%.4f", best_f1)
+    logger.info("Training complete. Best val_macro_f1=%.4f", best_f1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Dataset path builder  (mirrors get_dataset_path in train_unet.py)
 # ══════════════════════════════════════════════════════════════════════════════
+def update_paths(base_path, df):
+    df["image_path"] = (
+        base_path + "/" + df["image_path"].astype(str).where(df["image_path"].notna())
+    )
+    df["json_file"] = (
+        base_path + "/" + df["json_file"].astype(str).where(df["json_file"].notna())
+    )
+    df["coco_file"] = (
+        base_path + "/" + df["coco_file"].astype(str).where(df["coco_file"].notna())
+    )
+    return df
 
 
 def get_dataset_path(logger, config, cfg: ResNetConfig) -> str:
@@ -533,7 +605,7 @@ def get_dataset_path(logger, config, cfg: ResNetConfig) -> str:
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
-
+# same as unet
 def get_configpath():
     parser = argparse.ArgumentParser(description="ResNet classification training")
     parser.add_argument("-p", "--profile")
@@ -547,8 +619,8 @@ def get_configpath():
 if __name__ == "__main__":
     config_path = get_configpath()
     config      = load_config(config_path)
-    logger      = initialize_logger(config=config)
-    resnet_ini  = load_config(config.get("CLASSIFICATION-RESNET", "resnet.config"))
+    resnet_ini  = config.get("CLASSIFICATION-RESNET", "resnet.config")
+    logger      = initialize_logger(resnet_ini)
     cfg         = ResNetConfig(resnet_ini)
-    csv_path    = get_dataset_path(logger, config, cfg)
+    csv_path    = get_dataset_path(logger=logger, config=config, cfg=cfg)
     train(logger=logger, cfg=cfg, csv_path=csv_path)
