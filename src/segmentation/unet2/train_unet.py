@@ -55,6 +55,27 @@ from pathlib import Path
 from typing import Optional, Dict
 from torchvision.utils import make_grid
 
+
+def unnormalize(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Reverse ImageNet normalisation for display purposes only.
+
+    The dataset applies transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    so the encoder receives inputs in the distribution it was pretrained on.
+    That means raw tensor values are NOT valid 0-1 pixel colours any more —
+    displaying them directly (as img_np * 255) produces the distorted /
+    neon-looking "Original" panel seen in validation visualisations.
+
+    This function undoes that normalisation: pixel = tensor * std + mean,
+    then clamps to [0, 1] so the result is safe to scale to 0-255 and display.
+    Only ever call this on a tensor right before converting it to a numpy
+    image for matplotlib — never feed the unnormalised tensor back into the
+    model.
+    """
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(tensor.device)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(tensor.device)
+    return (tensor * std + mean).clamp(0, 1)
+
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
@@ -516,6 +537,11 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         3. Build optimiser + LR scheduler
         4. (Optional) resume from checkpoint
         5. Epoch loop: train → validate → checkpoint
+        Input : logger : logger object
+                cfg : UnetConfig object
+                csv_path : string (path for training dataset)
+        Output : None
+        Exception throws : 
     """
     device = _resolve_device(logger, cfg.device)
     logger.info("=" * 60)
@@ -579,7 +605,7 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         # over cfg.epochs steps.  This prevents aggressive drops that can
         # destabilise the pretrained encoder weights.
         # Formula: η_t = η_min + ½(η_max − η_min)(1 + cos(π · t / T_max))
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        scheduler = optim.lr_scheduler.AnnealingCosineLR(
             optimizer,
             T_max=cfg.epochs,
             eta_min=cfg.min_lr,
@@ -767,7 +793,14 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
                 preds = (probs > cfg.mask_threshold).long()
 
                 # Save visualization
-                img_np = images[0].cpu().permute(1, 2, 0).numpy()
+                # Unnormalise before converting to a displayable image —
+                # without this, pixel values are still in ImageNet-normalised
+                # space (can be negative), producing the distorted/neon
+                # "Original" panel instead of the real photo. The overlay
+                # panel is built from this same corrected image, so the
+                # green/blue regions now sit on top of the real photo too.
+                img_unnorm = unnormalize(images[0])
+                img_np = img_unnorm.cpu().permute(1, 2, 0).numpy()
                 img_np = (img_np * 255).astype(np.uint8)
 
                 pred_np = preds[0].cpu().numpy()
@@ -861,7 +894,7 @@ def update_paths(base_path, df):
     return df
 
 
-def get_dataset_path(logger, config, cfg: UNetConfig) -> pd.DataFrame:
+def get_dataset_path(logger, config, cfg: UNetConfig) -> str:
     """
     Two datasets are available:
     Based on the config we will take rows from different datasets
