@@ -92,6 +92,30 @@ from src.segmentation.unet2.unet_builder import (
     _resolve_device,
 )
 
+# Add this function after the imports, before _soft_dice_loss()
+
+def denormalize_image(image: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a normalized CHW image tensor back to normal RGB values [0, 1].
+
+    This assumes build_data_loaders() uses ImageNet normalization:
+    Normalize(mean=[0.485, 0.456, 0.406],
+              std=[0.229, 0.224, 0.225])
+    """
+    mean = torch.tensor(
+        [0.485, 0.456, 0.406],
+        dtype=image.dtype,
+        device=image.device,
+    ).view(3, 1, 1)
+
+    std = torch.tensor(
+        [0.229, 0.224, 0.225],
+        dtype=image.dtype,
+        device=image.device,
+    ).view(3, 1, 1)
+
+    return (image * std + mean).clamp(0.0, 1.0)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Loss functions
 # ══════════════════════════════════════════════════════════════════════════════
@@ -758,10 +782,11 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
     )
     logger.info(f" Best model saved to: {final_model_path}")
 
-    # ── Save test/visualization results ───────────────────────────────
+    # ── Save test/visualization results ─────────────────────────────────────
     if val_loader is not None and len(val_loader) > 0:
         output_dir = Path(cfg.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
         viz_dir = output_dir / "visualizations"
         viz_dir.mkdir(parents=True, exist_ok=True)
 
@@ -769,18 +794,24 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         model.eval()
         results = []
 
-        # Load val CSV to look up patient_id and image_path per sample index.
-        # val_loader iterates in the same order as the underlying val dataset
-        # rows, so index i in the loop matches row i in the val subset of the CSV.
         import pandas as _pd
-        _full_df   = _pd.read_csv(csv_path, dtype=str)
-        _full_df   = _full_df[_full_df["coco_file"].notna()].reset_index(drop=True)
-        # Reconstruct the same val split using the same seed so indices align
+
+        _full_df = _pd.read_csv(csv_path, dtype=str)
+        _full_df = _full_df[_full_df["coco_file"].notna()].reset_index(drop=True)
+
         try:
             from sklearn.model_selection import GroupShuffleSplit as _GSS
-            _gss = _GSS(n_splits=1, test_size=cfg.val_split, random_state=cfg.seed)
-            _, _val_idx = next(_gss.split(_full_df, groups=_full_df["patient_id"].values))
+
+            _gss = _GSS(
+                n_splits=1,
+                test_size=cfg.val_split,
+                random_state=cfg.seed,
+            )
+            _, _val_idx = next(
+                _gss.split(_full_df, groups=_full_df["patient_id"].values)
+            )
             _val_df = _full_df.iloc[_val_idx].reset_index(drop=True)
+
         except Exception:
             _val_df = None
 
@@ -788,53 +819,86 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
             for i, (images, masks) in enumerate(val_loader):
                 images = images.to(device)
                 masks = masks.to(device)
+
                 logits = model(images)
                 probs = torch.sigmoid(logits.squeeze(1))
                 preds = (probs > cfg.mask_threshold).long()
 
-                # Save visualization
-                # Unnormalise before converting to a displayable image —
-                # without this, pixel values are still in ImageNet-normalised
-                # space (can be negative), producing the distorted/neon
-                # "Original" panel instead of the real photo. The overlay
-                # panel is built from this same corrected image, so the
-                # green/blue regions now sit on top of the real photo too.
-                img_unnorm = unnormalize(images[0])
-                img_np = img_unnorm.cpu().permute(1, 2, 0).numpy()
-                img_np = (img_np * 255).astype(np.uint8)
+                # Convert normalized model input back to a real RGB image.
+                real_image = denormalize_image(images[0])
+
+                img_np = (
+                    real_image
+                    .permute(1, 2, 0)
+                    .mul(255)
+                    .round()
+                    .byte()
+                    .cpu()
+                    .numpy()
+                )
 
                 pred_np = preds[0].cpu().numpy()
                 gt_np = masks[0].cpu().numpy()
 
-                # Create overlay
-                overlay = img_np.copy()
-                overlay[pred_np == 1] = [0, 255, 0]  # Green prediction
-                overlay[gt_np == 1] = [0, 0, 255]  # Blue ground truth (overwrites)
+                # Preserve the original RGB image and blend masks into it.
+                overlay = img_np.astype(np.float32).copy()
 
-                # Build patient ID + image stem for the title
+                # Green = prediction
+                overlay[pred_np == 1] = (
+                    0.55 * overlay[pred_np == 1]
+                    + 0.45 * np.array([0, 255, 0], dtype=np.float32)
+                )
+
+                # Blue = ground truth
+                overlay[gt_np == 1] = (
+                    0.55 * overlay[gt_np == 1]
+                    + 0.45 * np.array([0, 0, 255], dtype=np.float32)
+                )
+
+                overlay = overlay.clip(0, 255).astype(np.uint8)
+
                 if _val_df is not None and i < len(_val_df):
-                    _row       = _val_df.iloc[i]
-                    _patient   = _row.get("patient_id", "unknown")
-                    _img_stem  = Path(str(_row.get("image_path", ""))).stem
-                    _sup_title = f"Patient: {_patient}  |  Image: {_img_stem}"
+                    _row = _val_df.iloc[i]
+                    _patient = _row.get("patient_id", "unknown")
+                    _img_stem = Path(
+                    str(_row.get("image_path", ""))
+                    ).stem
+                    _sup_title = (
+                        f"Patient: {_patient} | Image: {_img_stem}"
+                    )
                 else:
                     _sup_title = f"Sample {i:04d}"
 
                 fig = plt.figure(figsize=(15, 5))
-                fig.suptitle(_sup_title, fontsize=11, fontweight="bold")
+                fig.suptitle(
+                    _sup_title,
+                    fontsize=11,
+                    fontweight="bold",
+                )
+
                 plt.subplot(1, 3, 1)
                 plt.imshow(img_np)
-                plt.title("Original")
+                plt.title("Original RGB Image")
+                plt.axis("off")
+
                 plt.subplot(1, 3, 2)
-                plt.imshow(pred_np, cmap="gray")
-                plt.title("Prediction")
+                plt.imshow(pred_np, cmap="gray", vmin=0, vmax=1)
+                plt.title("Predicted Mask")
+                plt.axis("off")
+
                 plt.subplot(1, 3, 3)
                 plt.imshow(overlay)
-                plt.title("Overlay (Green=Pred, Blue=GT)")
+                plt.title("Overlay (Green=Prediction, Blue=Ground Truth)")
+                plt.axis("off")
+
+                plt.tight_layout()
+
                 plt.savefig(
-                    viz_dir / f"val_sample_{i:04d}.png", bbox_inches="tight", dpi=200
+                    viz_dir / f"val_sample_{i:04d}.png",
+                    bbox_inches="tight",
+                    dpi=200,
                 )
-                plt.close()
+                plt.close(fig)
 
                 results.append(
                     {
@@ -843,6 +907,16 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
                         "iou": compute_metrics(preds, masks)["iou"],
                     }
                 )
+
+        pd.DataFrame(results).to_csv(
+            output_dir / "val_results.csv",
+            index=False,
+        )
+
+        logger.info(
+            "Validation results and real-image visualizations saved to: %s",
+            output_dir,
+        )
 
         # Save summary
         pd.DataFrame(results).to_csv(output_dir / "val_results.csv", index=False)
