@@ -620,7 +620,8 @@ if __name__ == "__main__":
     config_path   = get_configpath()
     config        = load_config(config_path)
     resnet_ini    = config.get("CLASSIFICATION-RESNET", "resnet.config")
-    logger        = initialize_logger(config)      # LOGGER section lives in the main config
-    cfg           = ResNetConfig(resnet_ini)        # ResNetConfig still takes the raw path
+    resnet_config = load_config(resnet_ini)          # parse resnet.ini
+    logger        = initialize_logger(config)         # LOGGER section lives in main config
+    cfg           = ResNetConfig(resnet_config)        # ResNetConfig wants the parsed object
     csv_path      = get_dataset_path(logger=logger, config=config, cfg=cfg)
     train(logger=logger, cfg=cfg, csv_path=csv_path)
