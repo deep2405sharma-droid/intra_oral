@@ -843,16 +843,28 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
                 # Preserve the original RGB image and blend masks into it.
                 overlay = img_np.astype(np.float32).copy()
 
-                # Green = prediction
-                overlay[pred_np == 1] = (
-                    0.55 * overlay[pred_np == 1]
+                pred_bool = pred_np == 1
+                gt_bool = gt_np == 1
+                overlap = pred_bool & gt_bool
+                pred_only = pred_bool & ~gt_bool
+                gt_only = gt_bool & ~pred_bool
+
+                # Green = prediction only (model said lesion, GT didn't)
+                overlay[pred_only] = (
+                    0.55 * overlay[pred_only]
                     + 0.45 * np.array([0, 255, 0], dtype=np.float32)
                 )
 
-                # Blue = ground truth
-                overlay[gt_np == 1] = (
-                    0.55 * overlay[gt_np == 1]
+                # Blue = ground truth only (GT says lesion, model missed it)
+                overlay[gt_only] = (
+                    0.55 * overlay[gt_only]
                     + 0.45 * np.array([0, 0, 255], dtype=np.float32)
+                )
+
+                # Cyan = overlap (model and GT agree)
+                overlay[overlap] = (
+                    0.55 * overlay[overlap]
+                    + 0.45 * np.array([0, 255, 255], dtype=np.float32)
                 )
 
                 overlay = overlay.clip(0, 255).astype(np.uint8)
@@ -888,7 +900,7 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
 
                 plt.subplot(1, 3, 3)
                 plt.imshow(overlay)
-                plt.title("Overlay (Green=Prediction, Blue=Ground Truth)")
+                plt.title("Overlay (Green=Pred only, Blue=GT only, Cyan=Overlap)")
                 plt.axis("off")
 
                 plt.tight_layout()
