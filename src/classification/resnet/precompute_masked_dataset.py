@@ -52,6 +52,8 @@ from src.segmentation.unet2.unet_builder import (
     _coco_to_semantic_mask,
     LESION_CLASS_MAP,
 )
+from src.classification.resnet.resnet_config import ResNetConfig
+from src.classification.resnet.train_resnet import get_dataset_path
 
 
 def apply_mask_to_image(
@@ -95,6 +97,21 @@ def main():
     # coco_file column (inherited from the merged dataset shared with
     # Mask R-CNN / U-Net), even though Pipeline A itself never reads it.
     src_csv = config.get("CLASSIFICATION-RESNET", "train.dataset")
+
+    # Kaggle sessions start fresh each time, so this CSV won't exist yet
+    # unless train_resnet.py has already run once in this session. Rather
+    # than requiring that as a manual prerequisite, build it here the
+    # first time — same get_dataset_path() function train_resnet.py uses,
+    # so there's no duplicated dataset-building logic to drift out of sync.
+    if not Path(src_csv).exists():
+        logger.info(
+            "%s not found — building it now via get_dataset_path() "
+            "(same step train_resnet.py runs).",
+            src_csv,
+        )
+        resnet_ini_path = config.get("CLASSIFICATION-RESNET", "resnet.config")
+        resnet_cfg = ResNetConfig(load_config(resnet_ini_path))
+        src_csv = get_dataset_path(logger=logger, config=config, cfg=resnet_cfg)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
