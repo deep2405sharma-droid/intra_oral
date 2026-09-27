@@ -150,6 +150,84 @@ def _collate_fn(batch):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Stratified, patient-wise train/val split
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def stratified_group_split(
+    df: pd.DataFrame,
+    val_split: float,
+    seed: int,
+    logger: logging.Logger = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Patient-wise, class-stratified train/val split.
+
+    Two properties, both required, at once:
+      - group-aware: every image from one patient_id stays entirely on
+        one side of the split (no patient appears in both train and val)
+      - stratified: each class's proportion (normal/opmd/variation) is
+        preserved as closely as possible on both sides, instead of being
+        left to chance the way plain GroupShuffleSplit does — this matters
+        because opmd/variation are small classes, where an unlucky
+        random patient-level split can easily starve val (or train) of
+        a class almost entirely.
+
+    sklearn has no direct "StratifiedGroupShuffleSplit" for an arbitrary
+    train/val ratio, so this approximates one with StratifiedGroupKFold:
+    pick n_splits so that 1/n_splits ≈ val_split, then use only the
+    first fold as the split. The remaining folds are never touched —
+    this is NOT cross-validation, just a way to get one stratified,
+    group-aware split out of a tool built for K-fold CV.
+
+    IMPORTANT: this is the SINGLE source of truth for the split.
+    build_data_loaders() and train_resnet.py's per-sample val_results.csv
+    logging both call this same function (with the same df/val_split/
+    seed) rather than each keeping their own copy of the split logic —
+    that guarantees they can never silently disagree about which rows
+    are in val, which would misalign val_results.csv's patient_id/
+    image_path columns against the model's actual predictions.
+
+    Falls back to plain GroupShuffleSplit (patient-wise, but NOT
+    class-stratified) if the installed sklearn predates
+    StratifiedGroupKFold (added in scikit-learn 1.0).
+    """
+    groups = df["patient_id"].values
+    labels = df["label"].values
+
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+
+        n_splits = max(2, round(1.0 / val_split))
+        sgkf = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=seed
+        )
+        train_idx, val_idx = next(sgkf.split(df, y=labels, groups=groups))
+        if logger is not None:
+            logger.info(
+                "  Stratified group split (StratifiedGroupKFold, n_splits=%d, "
+                "fold 0 used as val — this is NOT cross-validation)",
+                n_splits,
+            )
+    except ImportError:
+        from sklearn.model_selection import GroupShuffleSplit
+
+        if logger is not None:
+            logger.warning(
+                "StratifiedGroupKFold not available in this sklearn version "
+                "(needs >=1.0) — falling back to plain GroupShuffleSplit. "
+                "The split will still be patient-wise but will NOT be "
+                "class-stratified."
+            )
+        gss = GroupShuffleSplit(n_splits=1, test_size=val_split, random_state=seed)
+        train_idx, val_idx = next(gss.split(df, groups=groups))
+
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df   = df.iloc[val_idx].reset_index(drop=True)
+    return train_df, val_df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # build_data_loaders
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -168,9 +246,11 @@ def build_data_loaders(
     """
     Read the dataset CSV and return (train_loader, val_loader, num_classes).
 
-    Patient-wise split using GroupShuffleSplit — same leak-prevention logic
-    as unet_builder.py: all images of one patient go entirely into either
-    train or val, never split across both.
+    Patient-wise, class-stratified split via stratified_group_split():
+    all images of one patient go entirely into either train or val (never
+    split across both), AND each class's proportion is preserved on both
+    sides as closely as possible — see stratified_group_split()'s
+    docstring for why plain GroupShuffleSplit isn't enough here.
 
     Optionally uses WeightedRandomSampler on the training set to oversample
     minority classes (opmd, variation) so each batch sees a balanced mix
@@ -197,26 +277,19 @@ def build_data_loaders(
             f"Need ≥2 unique patient_ids for split, got {len(patient_ids)}."
         )
 
-    # ── Patient-wise split ─────────────────────────────────────────────
+    # ── Patient-wise, class-stratified split ────────────────────────────
     try:
-        from sklearn.model_selection import GroupShuffleSplit
-        _HAS_SKLEARN = True
+        train_df, val_df = stratified_group_split(
+            df, val_split=val_split, seed=seed, logger=logger,
+        )
     except ImportError:
-        _HAS_SKLEARN = False
+        # sklearn isn't installed at all (not even GroupShuffleSplit) —
+        # last-resort fallback with no stratification and no group
+        # awareness beyond a simple patient-level shuffle.
         logger.warning(
             "sklearn not installed — falling back to random.shuffle. "
             "Install with: pip install scikit-learn"
         )
-
-    if _HAS_SKLEARN:
-        gss = GroupShuffleSplit(
-            n_splits=1, test_size=val_split, random_state=seed
-        )
-        groups = df["patient_id"].values
-        train_idx, val_idx = next(gss.split(df, groups=groups))
-        train_df = df.iloc[train_idx].reset_index(drop=True)
-        val_df   = df.iloc[val_idx].reset_index(drop=True)
-    else:
         import random
         rng = random.Random(seed)
         shuffled = patient_ids.copy()
@@ -246,6 +319,10 @@ def build_data_loaders(
     logger.info(
         "  Train label distribution:\n%s",
         train_df["label"].value_counts().to_string(),
+    )
+    logger.info(
+        "  Val label distribution:\n%s",
+        val_df["label"].value_counts().to_string(),
     )
 
     train_ds = ResNetDataset(

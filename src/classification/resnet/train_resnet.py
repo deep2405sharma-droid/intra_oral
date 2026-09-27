@@ -56,6 +56,7 @@ from src.classification.resnet.resnet_builder import (
     CLASS_WEIGHTS,
     build_lesion_model,
     build_data_loaders,
+    stratified_group_split,
     save_checkpoint,
     load_checkpoint,
     _resolve_device,
@@ -344,28 +345,29 @@ def validate_one_epoch(
 
 def train(logger, cfg: ResNetConfig, csv_path: str) -> None:
     """
-    Full ResNet classification training pipeline:
-        1. Build data loaders (patient-wise split)
-        2. Build model (ResNet50 + custom FC head)
+    Full ResNet classification training pipeline:                # logger : writes progress and error message
+        1. Build data loaders (patient-wise split)               # cfg : contains settings such as epochs, learning rate, batch size, folders, etc.
+        2. Build model (ResNet50 + custom FC head)               # csv_path : path to dataset
         3. Build weighted CrossEntropy loss
         4. Build optimizer (separate LR for backbone and head)
         5. Build LR scheduler (cosine / step / plateau)
         6. Resume from checkpoint if available
         7. Epoch loop: train -> validate -> checkpoint
     """
-    device = _resolve_device(logger, cfg.device)
+    device = _resolve_device(logger, cfg.device)                   # chooses where device run cpu or gpu
     logger.info("=" * 60)
-    logger.info("  ResNet50 Classification  |  device=%s", device)
+    logger.info("  ResNet50 Classification  |  device=%s", device) # prints headings
     logger.info("=" * 60)
 
     # Output dirs
-    output_dir     = Path(cfg.output_dir)
-    checkpoint_dir = Path(cfg.checkpoint_dir)
+    output_dir     = Path(cfg.output_dir)                 # contains validation predictions/result
+    checkpoint_dir = Path(cfg.checkpoint_dir)             # saved model files and output history
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # Data loaders
-    train_loader, val_loader, num_classes = build_data_loaders(
+    train_loader, val_loader, num_classes = build_data_loaders(  # func to prepare data for pytorch
+    
         logger=logger,
         csv_path=csv_path,
         label_class_map=LABEL_CLASS_MAP,
@@ -377,14 +379,23 @@ def train(logger, cfg: ResNetConfig, csv_path: str) -> None:
         weighted_sampler=cfg.weighted_sampler,
     )
 
-    # Reconstruct val_df (same seed/split) for per-sample result logging
+    # Reconstruct val_df for per-sample result logging — via the SAME
+    # stratified_group_split() helper build_data_loaders() just used
+    # above (same df filtering, same val_split, same seed), rather than a
+    # second independent copy of the split logic. Two separate copies of
+    # "recreate the split" is exactly how this used to silently drift:
+    # the old version here filtered only on `label`, while
+    # build_data_loaders() also filters on `image_path` not being null —
+    # a different row count/order fed into the same random_state would
+    # have produced a DIFFERENT split, misaligning val_results.csv's
+    # patient_id/image_path columns against what the model actually saw.
     try:
-        from sklearn.model_selection import GroupShuffleSplit
         _full_df = pd.read_csv(csv_path, dtype=str)
         _full_df = _full_df[_full_df["label"].isin(LABEL_CLASS_MAP.keys())].reset_index(drop=True)
-        _gss     = GroupShuffleSplit(n_splits=1, test_size=cfg.val_split, random_state=cfg.seed)
-        _, _val_idx = next(_gss.split(_full_df, groups=_full_df["patient_id"].values))
-        val_df   = _full_df.iloc[_val_idx].reset_index(drop=True)
+        _full_df = _full_df[_full_df["image_path"].notna()].reset_index(drop=True)
+        _, val_df = stratified_group_split(
+            _full_df, val_split=cfg.val_split, seed=cfg.seed, logger=logger,
+        )
     except Exception:
         val_df = None
 
