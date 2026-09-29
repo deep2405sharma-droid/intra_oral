@@ -44,6 +44,7 @@ from src.classification.efficientnet.efficientnet_builder import (
 )
 from src.classification.efficientnet.efficientnet_config import EfficientNetConfig
 from src.classification.resnet.train_resnet import get_dataset_path
+from src.classification.resnet.resnet_builder import stratified_group_split
 
 _ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -287,14 +288,21 @@ def train(logger, cfg: EfficientNetConfig, csv_path: str) -> None:
         weighted_sampler=cfg.weighted_sampler,
     )
 
-    # Reconstruct val_df (same seed/split) for per-sample result logging
+    # Reconstruct val_df for per-sample result logging — via the SAME
+    # stratified_group_split() helper build_data_loaders() just used
+    # above (same df filtering, same val_split, same seed), not a second
+    # independent copy of the split logic. Also matches build_data_loaders'
+    # filtering exactly (label AND image_path not null) — the old version
+    # here filtered only on label, which could feed a different row
+    # count/order into the same random_state and silently produce a
+    # different split than the one val_loader actually used.
     try:
-        from sklearn.model_selection import GroupShuffleSplit
         _full_df = pd.read_csv(csv_path, dtype=str)
         _full_df = _full_df[_full_df["label"].isin(LABEL_CLASS_MAP.keys())].reset_index(drop=True)
-        _gss     = GroupShuffleSplit(n_splits=1, test_size=cfg.val_split, random_state=cfg.seed)
-        _, _val_idx = next(_gss.split(_full_df, groups=_full_df["patient_id"].values))
-        val_df   = _full_df.iloc[_val_idx].reset_index(drop=True)
+        _full_df = _full_df[_full_df["image_path"].notna()].reset_index(drop=True)
+        _, val_df = stratified_group_split(
+            _full_df, val_split=cfg.val_split, seed=cfg.seed, logger=logger,
+        )
     except Exception:
         val_df = None
 

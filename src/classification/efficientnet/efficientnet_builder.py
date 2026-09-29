@@ -7,7 +7,8 @@ same 3-class (normal/opmd/variation) task as resnet_builder.py.
 
 Mirrors resnet_builder.py exactly:
   - Same LABEL_CLASS_MAP / 3-class setup
-  - Same patient-wise GroupShuffleSplit train/val split
+  - Same patient-wise, class-stratified train/val split (imported from
+    resnet_builder.stratified_group_split — not duplicated here)
   - Same checkpoint save/load pattern
   - Same augmentation philosophy (no flips — left/right oral anatomy is
     clinically meaningful)
@@ -30,6 +31,8 @@ import torch.nn as nn
 from PIL import Image as PILImage
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import models, transforms
+
+from src.classification.resnet.resnet_builder import stratified_group_split
 
 
 # ── Label -> class id mapping — SAME 3 classes as resnet_builder.py ──
@@ -176,23 +179,21 @@ def build_data_loaders(
             f"Need ≥2 unique patient_ids for split, got {len(patient_ids)}."
         )
 
+    # Patient-wise, class-stratified split — same shared helper
+    # resnet_builder.build_data_loaders() uses, so all classifier
+    # pipelines split identically for the same seed/val_split.
     try:
-        from sklearn.model_selection import GroupShuffleSplit
-        _HAS_SKLEARN = True
+        train_df, val_df = stratified_group_split(
+            df, val_split=val_split, seed=seed, logger=logger,
+        )
     except ImportError:
-        _HAS_SKLEARN = False
+        # sklearn isn't installed at all — last-resort fallback with no
+        # stratification and no group awareness beyond a simple
+        # patient-level shuffle.
         logger.warning(
             "sklearn not installed — falling back to random.shuffle. "
             "Install with: pip install scikit-learn"
         )
-
-    if _HAS_SKLEARN:
-        gss = GroupShuffleSplit(n_splits=1, test_size=val_split, random_state=seed)
-        groups = df["patient_id"].values
-        train_idx, val_idx = next(gss.split(df, groups=groups))
-        train_df = df.iloc[train_idx].reset_index(drop=True)
-        val_df   = df.iloc[val_idx].reset_index(drop=True)
-    else:
         import random
         rng = random.Random(seed)
         shuffled = patient_ids.copy()
@@ -217,6 +218,9 @@ def build_data_loaders(
     )
     logger.info(
         "  Train label distribution:\n%s", train_df["label"].value_counts().to_string(),
+    )
+    logger.info(
+        "  Val label distribution:\n%s", val_df["label"].value_counts().to_string(),
     )
 
     train_ds = EfficientNetDataset(
